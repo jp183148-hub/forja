@@ -1018,7 +1018,7 @@ function emptyDB() {
     settings: { course: 'FORJA — Formação em Manutenção de Celulares', founder: 'João Pedro' },
     students: [], student_profiles: [], cohorts: [], modules: [], lessons: [], materials: [], library: [],
     progress: [], questions: [], ai_conversations: [], announcements: [], admin_notes: [],
-    encounters: [], assessments: [], assessment_results: []
+    encounters: [], assessments: [], assessment_results: [], invites: []
   };
 }
 
@@ -1138,6 +1138,12 @@ async function loadAllNow() {
   db.assessment_results = (assessResR.data || []).map(inAssessRes);
   const notesByEnc = new Map((encNotesR.data || []).map(n => [n.encounter_id, n]));
   db.encounters = (encR.data || []).map(r => buildEncounter(r, partR.data || [], notesByEnc.get(r.id)));
+  // Lista de convidados: só o admin enxerga (o banco também bloqueia para alunos).
+  if (isAdmin()) {
+    const invR = await sb.from('invites').select('*').order('created_at', { ascending: false });
+    db.invites = invR.error ? [] : (invR.data || []);
+    db.invitesReady = !invR.error;
+  }
   DB = db;
 
   const me = myStudent();
@@ -1295,6 +1301,11 @@ const API = {
     const { data: signData, error: signErr } = await sb.auth.signUp({ email, password: d.password });
     if (signErr) {
       if (/registered|already/i.test(signErr.message)) throw new Error('Este e-mail já tem cadastro. Entre com sua senha.');
+      // O banco recusa a criação da conta quando o e-mail não está na lista de convidados.
+      if (/database error|FORJA_CONVITE/i.test(signErr.message) || signErr.status === 500) {
+        const inv = new Error(`O e-mail ${email} não está na lista de convidados da FORJA. Use exatamente o e-mail que você passou ao instrutor, ou fale com ele para receber o convite.`);
+        inv.invite = true; throw inv;
+      }
       throw new Error(signErr.message);
     }
     // Supabase não avisa por erro quando o e-mail já existe (evita revelar quem já é cadastrado):
@@ -1360,6 +1371,24 @@ const API = {
   student(id) { mustSelfOrAdmin(id); return DB.students.find(s => s.id === id) || null; },
   profile(id) { mustSelfOrAdmin(id); return profileOf(id); },
   listStudents() { mustAdmin(); return DB.students.slice(); },
+
+  // ---------- Convites (só quem está na lista consegue criar acesso) ----------
+  listInvites() { mustAdmin(); return (DB.invites || []).slice(); },
+  async createInvite(email, fullName) {
+    mustAdmin();
+    const e = String(email || '').trim().toLowerCase();
+    if (!emailValid(e)) throw new Error('Informe um e-mail válido.');
+    if (DB.students.some(s => String(s.email || '').trim().toLowerCase() === e)) throw new Error('Já existe um aluno com este e-mail.');
+    const { error } = await sb.from('invites').upsert({ email: e, full_name: String(fullName || '').trim() || null, used_at: null, user_id: null }, { onConflict: 'email' });
+    if (error) throw new Error(DB.invitesReady === false ? 'A lista de convites ainda não foi ativada no banco de dados.' : 'Não foi possível salvar o convite agora. Tente de novo.');
+    await loadAll();
+  },
+  async cancelInvite(email) {
+    mustAdmin();
+    const { error } = await sb.from('invites').delete().eq('email', email);
+    if (error) throw new Error('Não foi possível cancelar o convite agora.');
+    await loadAll();
+  },
   updateStudent(id, patch) {
     mustSelfOrAdmin(id);
     const s = DB.students.find(x => x.id === id); if (!s) return;
@@ -1764,7 +1793,7 @@ function viewLogin() {
       <button class="btn btn-gold btn-block" type="submit" ${busy ? 'disabled' : ''}>${busy ? 'Entrando…' : 'Entrar'}</button>
       <div class="row" style="justify-content:space-between;margin-top:18px">
         <button type="button" class="btn btn-quiet btn-sm" data-act="forgot">Esqueci minha senha</button>
-        <a class="small" href="#/cadastro">Criar meu acesso</a>
+        <a class="small" href="#/cadastro">Recebi convite: criar acesso</a>
       </div>
     </form>
   </div></div>`;
@@ -1787,7 +1816,7 @@ function viewSignup() {
   const { step, d, err } = UI.su;
   let body = '', title = '', sub = '';
   if (step === 1) {
-    title = 'Crie seu acesso'; sub = 'Para alunos matriculados na formação presencial. Leva cerca de 3 minutos.';
+    title = 'Crie seu acesso'; sub = 'Somente para alunos convidados pelo instrutor. Use o mesmo e-mail que você passou para ele. Leva cerca de 3 minutos.';
     body = field('full_name', 'Nome completo', { value: d.full_name, err: err.full_name, attrs: 'autocomplete="name"' })
       + field('email', 'E-mail', { type: 'email', value: d.email, err: err.email, attrs: 'autocomplete="email" inputmode="email"' })
       + `<div class="grid2">${field('password', 'Senha', { type: 'password', value: d.password, err: err.password, hint: 'Mínimo de 8 caracteres.', attrs: 'autocomplete="new-password"' })}${field('password2', 'Confirme a senha', { type: 'password', value: d.password2, err: err.password2, attrs: 'autocomplete="new-password"' })}</div>`;
@@ -2383,6 +2412,7 @@ function viewAdminStudents() {
   const sel = (name, label, opts) => `<label class="sr-only" for="af-${name}">${label}</label><select id="af-${name}" data-filter="${name}"><option value="">${label}</option>${opts.map(o => `<option value="${esc(o.k)}" ${f[name] === o.k ? 'selected' : ''}>${esc(o.l)}</option>`).join('')}</select>`;
   const presets = [['goal', 'abrir', 'Querem abrir assistência'], ['lvl', 'iniciante', 'Iniciantes'], ['equip', 'nao', 'Sem bancada'], ['since', '7', 'Novos na semana']];
   return `<header class="page-head"><p class="kicker">Acompanhamento individual</p><h1>Alunos</h1><p class="lead">Toque em um aluno para ver a ficha completa, a agenda e a evolução.</p></header>
+  ${invitesCard()}
   <div class="searchbar">${icon('search')}<input type="search" data-filter="q" placeholder="Buscar por nome, e-mail, telefone ou cidade" value="${esc(f.q)}" aria-label="Buscar aluno"></div>
   <div class="chips">${presets.map(([k, v, l]) => `<button class="chip" data-act="af-preset" data-k="${k}" data-v="${v}" aria-pressed="${f[k] === v}">${l}</button>`).join('')}</div>
   <div class="filters">
@@ -2397,6 +2427,25 @@ function viewAdminStudents() {
   </div>
   <div class="row" style="margin-bottom:18px"><button class="btn btn-quiet btn-sm" data-act="af-clear">Limpar filtros</button></div>
   <div id="stu-results">${studentResults()}</div>`;
+}
+function invitesCard() {
+  const all = API.listInvites();
+  const pend = all.filter(i => !i.used_at); const used = all.length - pend.length;
+  const warn = DB.invitesReady === false ? '<p class="warn small" style="margin:0 0 16px">A lista de convites ainda não foi ativada no banco de dados.</p>' : '';
+  return `<section class="card" style="margin-bottom:22px">
+    <p class="label-caps">${icon('users')} Convidar aluno</p>
+    <p class="small muted" style="margin:0 0 16px">Só quem estiver nesta lista consegue criar acesso na FORJA. Depois de convidar, copie a mensagem e mande para o aluno.</p>
+    ${warn}
+    <form data-form="invite" novalidate>
+      <div class="grid2">${field('full_name', 'Nome do aluno', { req: false, attrs: 'autocomplete="off"' })}${field('email', 'E-mail do aluno', { type: 'email', attrs: 'autocomplete="off" inputmode="email"' })}</div>
+      <p class="err" id="invite-err" role="alert"></p>
+      <button class="btn btn-gold btn-sm" type="submit">${icon('plus')} Convidar</button>
+    </form>
+    ${pend.length ? `<p class="label-caps" style="margin:24px 0 8px">Convites pendentes (${pend.length})</p>
+    <div class="rows">${pend.map(i => `<div class="lrow" style="flex-wrap:wrap"><div class="body"><strong>${esc(i.full_name || i.email)}</strong><span>${esc(i.email)} · convidado em ${fmtDate(i.created_at)}</span></div>
+      <div class="row" style="margin-top:0"><button class="btn btn-sm" data-act="invite-copy" data-email="${esc(i.email)}">${icon('send')} Copiar mensagem</button><button class="btn btn-sm btn-quiet" data-act="invite-cancel" data-email="${esc(i.email)}">Cancelar</button></div></div>`).join('')}</div>` : ''}
+    ${used ? `<p class="xs faint" style="margin:14px 0 0">${used} ${used === 1 ? 'convite já usado' : 'convites já usados'}.</p>` : ''}
+  </section>`;
 }
 function scheduleForm(s) {
   const today = isoDate(new Date()); const planned = (cohortOf(s) || {}).planned_meetings || 11;
@@ -2860,6 +2909,19 @@ const ACTIONS = {
   'validate-module': async a => { if (await confirmBox('Validar todos os conteúdos deste módulo para este aluno?', 'Concluir módulo', false)) { API.validateModule(a.dataset.s, a.dataset.m); toast('Módulo concluído.'); render(); } },
   'delete-student': async a => { if (await confirmBox('Excluir este aluno e todos os dados dele? Não dá para desfazer.', 'Excluir aluno')) { await API.deleteStudent(a.dataset.s); toast('Aluno excluído.'); go('#/admin/alunos'); } },
   'af-preset': a => { const k = a.dataset.k; UI.af[k] = UI.af[k] === a.dataset.v ? '' : a.dataset.v; render(); },
+  'invite-copy': async a => {
+    const email = a.dataset.email; const inv = API.listInvites().find(i => i.email === email) || {};
+    const link = location.origin + location.pathname + '#/cadastro';
+    const nome = inv.full_name ? ' ' + firstName(inv.full_name) : '';
+    const msg = `Olá${nome}! Seu acesso à área do aluno da FORJA está liberado.\n\n1. Abra: ${link}\n2. Crie seu acesso usando este e-mail: ${email}\n\nQualquer dúvida, me chama.`;
+    try { await navigator.clipboard.writeText(msg); toast('Mensagem copiada. Cole no WhatsApp do aluno.'); }
+    catch (e) { await infoBox('Copie a mensagem', 'Não deu para copiar automaticamente. Selecione e copie o texto abaixo:', msg); }
+  },
+  'invite-cancel': async a => {
+    const email = a.dataset.email;
+    if (!(await confirmBox(`Cancelar o convite de ${email}? Essa pessoa não vai conseguir criar acesso.`, 'Cancelar convite'))) return;
+    await API.cancelInvite(email); toast('Convite cancelado.'); render();
+  },
   'af-clear': () => { UI.af = { q: '', goal: '', lvl: '', exp: '', city: '', prog: '', since: '', status: '', equip: '' }; render(); },
   'content-tab': a => { UI.contentTab = a.dataset.t; render(); },
   'mod-new': () => { mustAdmin(); const pos = DB.modules.length + 1; const m = { id: newId(), position: pos, title: 'Novo módulo', summary: '', published: false, created_at: nowISO() }; DB.modules.push(m); Store.commit('modules', 'insert', m); go('#/admin/modulo/' + m.id); },
@@ -2896,7 +2958,13 @@ const FORMS = {
     if (UI.su.step < 4) { UI.su.step++; UI.su.err = {}; render(); window.scrollTo(0, 0); return; }
     UI.authBusy = true; render();
     try { await API.signUp(UI.su.d); UI.authBusy = false; UI.su = { step: 1, d: { secondary_goals: [] }, err: {} }; UI.animatedHome = false; toast('Cadastro concluído. Bem-vindo à FORJA.'); go('#/inicio'); }
-    catch (e) { UI.authBusy = false; toast(e.message); UI.su.step = 1; render(); }
+    catch (e) { UI.authBusy = false; UI.su.step = 1; render(); if (e.invite) await infoBox('Acesso somente por convite', e.message); else toast(e.message); }
+  },
+  async invite(f) {
+    const fd = new FormData(f); const err = $('#invite-err');
+    if (err) err.textContent = '';
+    try { await API.createInvite(fd.get('email'), fd.get('full_name')); toast('Convite criado. Agora copie a mensagem e mande para o aluno.'); render(); }
+    catch (e) { if (e instanceof Denied) throw e; if (err) err.textContent = e.message; }
   },
   async 'reset-password'(f) {
     if (UI.authBusy) return;
